@@ -6,6 +6,73 @@ import structlog
 
 logger = structlog.get_logger()
 
+# Word tokens with surrounding punctuation dropped ("Python," -> "python"), while keeping
+# punctuation that is part of a tech name: "node.js", "c++", "c#", "scikit-learn".
+_TOKEN_PATTERN = re.compile(r"[a-z0-9]+(?:[.\-][a-z0-9]+)*[+#]*")
+
+# Sentence ends: terminal punctuation followed by whitespace or end of text, so the
+# dots inside "Node.js" or "3.11" don't split a claim in two.
+_SENTENCE_END_PATTERN = re.compile(r"[.!?]+(?=\s|$)")
+
+_STOP_WORDS = {
+    "a",
+    "an",
+    "the",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "and",
+    "or",
+    "but",
+    "in",
+    "of",
+    "to",
+    "for",
+    "that",
+    "has",
+    "have",
+    "had",
+    "with",
+    "on",
+    "at",
+    "by",
+    "as",
+    "this",
+    "they",
+    "their",
+    "it",
+    "its",
+}
+
+# Generic resume words that describe *how much* someone knows rather than *what* they
+# know. Left in, they pad a claim's word count and dilute the share of words that
+# actually name a skill, which skews the fractional support score.
+_GENERIC_RESUME_WORDS = {
+    "developer",
+    "developers",
+    "candidate",
+    "knows",
+    "knowledge",
+    "experience",
+    "experienced",
+    "expertise",
+    "expert",
+    "skill",
+    "skills",
+    "skilled",
+    "strong",
+    "shows",
+    "demonstrated",
+}
+
+_IGNORED_WORDS = _STOP_WORDS | _GENERIC_RESUME_WORDS
+
+# Minimum support score for _is_supported() to call a claim supported.
+_SUPPORT_THRESHOLD = 0.5
+
 
 class FaithfulnessChecker:
     """Verify that feedback claims are supported by context."""
@@ -18,7 +85,7 @@ class FaithfulnessChecker:
             context_chunks: Retrieved context chunks
 
         Returns:
-            Faithfulness score 0.0-1.0 (ratio of supported claims)
+            Faithfulness score 0.0-1.0 (average support across claims)
         """
         if not feedback or not context_chunks:
             logger.info(
@@ -37,16 +104,24 @@ class FaithfulnessChecker:
         # Concatenate context text
         context_text = " ".join([chunk.get("text", "") for chunk in context_chunks])
 
-        # Check each claim for support
-        supported = 0
-        for claim in claims:
-            if self._is_supported(claim, context_text):
-                supported += 1
+        # Score each claim by how much of it the context supports. Claims made only of
+        # stop words and generic resume words assert nothing checkable, so skip them.
+        claim_scores = [
+            score
+            for claim in claims
+            if (score := self._support_score(claim, context_text)) is not None
+        ]
+        if not claim_scores:
+            logger.info("faithfulness_no_checkable_claims", claims_count=len(claims))
+            return 0.5  # Default to neutral if no claim names anything checkable
 
-        score = supported / len(claims) if claims else 0.0
+        score = sum(claim_scores) / len(claim_scores)
 
         logger.info(
-            "faithfulness_checked", claims_count=len(claims), supported_count=supported, score=score
+            "faithfulness_checked",
+            claims_count=len(claims),
+            scored_claims_count=len(claim_scores),
+            score=score,
         )
 
         return score
@@ -59,12 +134,42 @@ class FaithfulnessChecker:
             text: Feedback text
 
         Returns:
-            List of claims (sentences)
+            List of claims (sentences of two or more words)
         """
-        # Split by sentence (simple regex)
-        sentences = re.split(r"[.!?]+", text)
-        claims = [s.strip() for s in sentences if s.strip() and len(s.strip()) > 10]
+        sentences = _SENTENCE_END_PATTERN.split(text)
+        claims = [s.strip() for s in sentences if len(_TOKEN_PATTERN.findall(s.lower())) >= 2]
         return claims[:10]  # Limit to 10 claims for scoring
+
+    @staticmethod
+    def _tokenize(text: str) -> set[str]:
+        """Split text into lowercase word tokens, ignoring punctuation.
+
+        Args:
+            text: Text to tokenize
+
+        Returns:
+            Set of unique tokens
+        """
+        return set(_TOKEN_PATTERN.findall(text.lower()))
+
+    @staticmethod
+    def _support_score(claim: str, context: str) -> float | None:
+        """Score how much of a claim is supported by context.
+
+        Args:
+            claim: Claim text
+            context: Context text
+
+        Returns:
+            Share (0.0-1.0) of the claim's meaningful words found in context, or None
+            if the claim has no meaningful words to check
+        """
+        claim_tokens = FaithfulnessChecker._tokenize(claim) - _IGNORED_WORDS
+        if not claim_tokens:
+            return None
+
+        context_tokens = FaithfulnessChecker._tokenize(context)
+        return len(claim_tokens & context_tokens) / len(claim_tokens)
 
     @staticmethod
     def _is_supported(claim: str, context: str) -> bool:
@@ -75,34 +180,7 @@ class FaithfulnessChecker:
             context: Context text
 
         Returns:
-            True if claim is supported
+            True if at least half of the claim's meaningful words appear in context
         """
-        # Tokenize and check for keyword overlap
-        claim_tokens = set(claim.lower().split())
-        context_tokens = set(context.lower().split())
-
-        # Require at least some meaningful overlap
-        overlap = claim_tokens & context_tokens
-        # Filter out common stop words
-        stop_words = {
-            "a",
-            "an",
-            "the",
-            "is",
-            "are",
-            "was",
-            "were",
-            "be",
-            "been",
-            "and",
-            "or",
-            "but",
-            "in",
-            "of",
-            "to",
-            "for",
-            "that",
-        }
-        meaningful_overlap = overlap - stop_words
-
-        return len(meaningful_overlap) >= 2
+        score = FaithfulnessChecker._support_score(claim, context)
+        return score is not None and score >= _SUPPORT_THRESHOLD
